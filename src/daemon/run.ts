@@ -241,10 +241,42 @@ export async function startDaemon(): Promise<void> {
 
             // Create a temporary directory for Codex
             const codexHomeDir = tmp.dirSync();
+            const temporaryAuthPath = join(codexHomeDir.name, 'auth.json');
 
             // Write the token to the temporary directory
             // Must await to ensure the file is written before spawning the process
-            await fs.writeFile(join(codexHomeDir.name, 'auth.json'), options.token);
+            await fs.writeFile(temporaryAuthPath, options.token);
+
+            // Mirror existing Codex configuration so tailored MCP settings remain available
+            const defaultCodexHome = process.env.CODEX_HOME ?? join(os.homedir(), '.codex');
+            if (defaultCodexHome !== codexHomeDir.name) {
+              const skipEntries = new Set(['auth.json', 'sessions', 'log']);
+              try {
+                const entries = await fs.readdir(defaultCodexHome, { withFileTypes: true });
+                for (const entry of entries) {
+                  if (skipEntries.has(entry.name)) {
+                    continue;
+                  }
+                  const sourcePath = join(defaultCodexHome, entry.name);
+                  const destinationPath = join(codexHomeDir.name, entry.name);
+                  try {
+                    if (entry.isFile()) {
+                      await fs.copyFile(sourcePath, destinationPath);
+                    } else if (entry.isDirectory()) {
+                      await fs.cp(sourcePath, destinationPath, { recursive: true });
+                    }
+                  } catch (copyError: any) {
+                    if (copyError?.code !== 'ENOENT') {
+                      logger.debug(`[DAEMON RUN] Failed to mirror Codex config '${entry.name}':`, copyError);
+                    }
+                  }
+                }
+              } catch (mirrorError: any) {
+                if (mirrorError?.code !== 'ENOENT') {
+                  logger.debug('[DAEMON RUN] Unable to mirror existing Codex configuration:', mirrorError);
+                }
+              }
+            }
 
             // Set the environment variable for Codex
             extraEnv = {
