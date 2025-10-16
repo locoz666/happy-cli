@@ -442,6 +442,59 @@ export async function runCodex(opts: {
         session.sendCodexMessage(message);
     });
     client.setPermissionHandler(permissionHandler);
+
+    const sanitizeMcpSegment = (segment: string): string => {
+        return segment.replace(/[^a-zA-Z0-9_]/g, '_');
+    };
+
+    const buildMcpToolName = (server: unknown, tool: unknown): string | null => {
+        if (typeof server !== 'string' || typeof tool !== 'string') {
+            return null;
+        }
+        return `mcp__${sanitizeMcpSegment(server)}__${sanitizeMcpSegment(tool)}`;
+    };
+
+    const summarizeMcpResult = (result: unknown): string | null => {
+        if (!result || typeof result !== 'object') {
+            return null;
+        }
+        const record = result as Record<string, unknown>;
+        if ('Ok' in record) {
+            const okValue = record['Ok'];
+            if (okValue && typeof okValue === 'object') {
+                const okRecord = okValue as Record<string, unknown>;
+                const content = okRecord['content'];
+                if (Array.isArray(content)) {
+                    for (const entry of content) {
+                        if (entry && typeof entry === 'object') {
+                            const text = (entry as Record<string, unknown>)['text'];
+                            if (typeof text === 'string' && text.trim()) {
+                                const trimmed = text.trim();
+                                return trimmed.length > 200 ? `${trimmed.substring(0, 197)}…` : trimmed;
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        if ('Err' in record) {
+            const errorValue = record['Err'];
+            if (typeof errorValue === 'string') {
+                return `错误: ${errorValue}`;
+            }
+            if (errorValue && typeof errorValue === 'object') {
+                const errRecord = errorValue as Record<string, unknown>;
+                const message = errRecord['message'];
+                if (typeof message === 'string' && message.trim()) {
+                    return `错误: ${message.trim()}`;
+                }
+            }
+            return '工具调用返回错误';
+        }
+        return null;
+    };
+
     client.setHandler((msg) => {
         logger.debug(`[Codex] MCP message: ${JSON.stringify(msg)}`);
 
@@ -524,6 +577,41 @@ export async function runCodex(opts: {
                 output: output,
                 id: randomUUID()
             });
+        }
+        if (msg.type === 'mcp_tool_call_begin') {
+            const toolName = buildMcpToolName(msg.invocation?.server, msg.invocation?.tool);
+            if (!toolName) {
+                logger.debug('[Codex] 忽略缺少 server/tool 的 MCP 工具调用');
+            } else {
+                const readable = [msg.invocation?.server, msg.invocation?.tool].filter(Boolean).join(' · ');
+                if (readable) {
+                    messageBuffer.addMessage(`调用 MCP 工具：${readable}`, 'tool');
+                }
+                session.sendCodexMessage({
+                    type: 'tool-call',
+                    name: toolName,
+                    callId: msg.call_id,
+                    input: msg.invocation?.arguments ?? {},
+                    id: randomUUID()
+                });
+            }
+        }
+        if (msg.type === 'mcp_tool_call_end') {
+            const toolName = buildMcpToolName(msg.invocation?.server, msg.invocation?.tool);
+            if (!toolName) {
+                logger.debug('[Codex] 忽略缺少 server/tool 的 MCP 工具结果');
+            } else {
+                const summary = summarizeMcpResult(msg.result);
+                if (summary) {
+                    messageBuffer.addMessage(summary, 'result');
+                }
+                session.sendCodexMessage({
+                    type: 'tool-call-result',
+                    callId: msg.call_id,
+                    output: msg.result ?? {},
+                    id: randomUUID()
+                });
+            }
         }
         if (msg.type === 'token_count') {
             session.sendCodexMessage({
