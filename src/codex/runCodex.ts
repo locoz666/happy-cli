@@ -27,6 +27,7 @@ import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
+import toml from 'toml';
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -54,6 +55,57 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
     sendReady();
     notify?.();
     return true;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type CodexConfigData = {
+    baseConfig: Record<string, unknown>;
+    mcpServers: Record<string, Record<string, unknown>>;
+};
+
+function loadCodexConfig(): CodexConfigData {
+    const codexHomeDir = process.env.CODEX_HOME || join(os.homedir(), '.codex');
+    const configPath = join(codexHomeDir, 'config.toml');
+    const defaultResult: CodexConfigData = { baseConfig: {}, mcpServers: {} };
+
+    try {
+        if (!fs.existsSync(configPath)) {
+            return defaultResult;
+        }
+
+        const rawConfig = fs.readFileSync(configPath, 'utf8');
+        const parsed = toml.parse(rawConfig) as Record<string, unknown>;
+
+        if (!isPlainObject(parsed)) {
+            return defaultResult;
+        }
+
+        const { mcp_servers, ...rest } = parsed;
+        const baseConfig = Object.entries(rest).reduce<Record<string, unknown>>((acc, [key, value]) => {
+            acc[key] = value;
+            return acc;
+        }, {});
+
+        const mcpServers = isPlainObject(mcp_servers)
+            ? Object.entries(mcp_servers).reduce<Record<string, Record<string, unknown>>>((acc, [key, value]) => {
+                if (isPlainObject(value)) {
+                    acc[key] = { ...value };
+                }
+                return acc;
+            }, {})
+            : {};
+
+        return {
+            baseConfig,
+            mcpServers
+        };
+    } catch (error) {
+        logger.debug('[Codex] 无法读取 Codex 配置文件:', error);
+        return defaultResult;
+    }
 }
 
 /**
@@ -536,12 +588,14 @@ export async function runCodex(opts: {
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session);
     const bridgeCommand = join(projectPath(), 'bin', 'happy-mcp.mjs');
+    const { baseConfig: codexBaseConfig, mcpServers: baseMcpServers } = loadCodexConfig();
     const mcpServers = {
+        ...baseMcpServers,
         happy: {
             command: bridgeCommand,
             args: ['--url', happyServer.url]
         }
-    } as const;
+    };
     let first = true;
 
     try {
@@ -639,7 +693,10 @@ export async function runCodex(opts: {
                         prompt: first ? message.message + '\n\n' + trimIdent(`Based on this message, call functions.happy__change_title to change chat session title that would represent the current task. If chat idea would change dramatically - call this function again to update the title.`) : message.message,
                         sandbox,
                         'approval-policy': approvalPolicy,
-                        config: { mcp_servers: mcpServers }
+                        config: {
+                            ...codexBaseConfig,
+                            mcp_servers: mcpServers
+                        }
                     };
                     if (message.mode.model) {
                         startConfig.model = message.mode.model;
