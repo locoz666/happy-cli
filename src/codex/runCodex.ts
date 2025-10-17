@@ -174,6 +174,45 @@ export async function runCodex(opts: {
     };
     const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     const session = api.sessionSyncClient(response);
+    const serverMetadata: Metadata = response.metadata;
+    let currentCodexSessionId: string | null = serverMetadata.codexSessionId ?? null;
+
+    const persistCodexSessionMetadata = (newSessionId: string | null) => {
+        if (newSessionId === currentCodexSessionId) {
+            return;
+        }
+        currentCodexSessionId = newSessionId;
+        session.updateMetadata((currentMetadata) => {
+            const next: Metadata = { ...currentMetadata };
+            if (newSessionId) {
+                next.codexSessionId = newSessionId;
+                next.codexSessionUpdatedAt = Date.now();
+            } else {
+                delete next.codexSessionId;
+                delete next.codexSessionUpdatedAt;
+            }
+            return next;
+        });
+        if (newSessionId) {
+            logger.debug('[Codex] 会话元数据已更新，记录 Codex session ID:', newSessionId);
+        } else {
+            logger.debug('[Codex] 已清除 Codex session ID 元数据');
+        }
+    };
+
+    if (currentCodexSessionId) {
+        logger.debug('[Codex] 检测到已存在的 Codex session ID，可用于恢复:', currentCodexSessionId);
+    }
+    let storedSessionIdForResume: string | null = currentCodexSessionId;
+    let nextExperimentalResume: string | null = null;
+    if (storedSessionIdForResume) {
+        nextExperimentalResume = findCodexResumeFile(storedSessionIdForResume);
+        if (nextExperimentalResume) {
+            logger.debug('[Codex] 启动时找到 Codex transcript，可用于恢复:', nextExperimentalResume);
+        } else {
+            logger.debug('[Codex] 启动时未找到对应的 Codex transcript，使用全新会话');
+        }
+    }
 
     // Always report to daemon if it exists
     try {
@@ -276,7 +315,6 @@ export async function runCodex(opts: {
 
     let abortController = new AbortController();
     let shouldExit = false;
-    let storedSessionIdForResume: string | null = null;
 
     /**
      * Handles aborting the current task/inference without exiting the process.
@@ -290,6 +328,10 @@ export async function runCodex(opts: {
             if (client.hasActiveSession()) {
                 storedSessionIdForResume = client.storeSessionForResume();
                 logger.debug('[Codex] Stored session for resume:', storedSessionIdForResume);
+                persistCodexSessionMetadata(storedSessionIdForResume);
+            } else {
+                storedSessionIdForResume = null;
+                persistCodexSessionMetadata(null);
             }
             
             abortController.abort();
@@ -315,6 +357,8 @@ export async function runCodex(opts: {
         logger.debug('[Codex] Kill session requested - terminating process');
         await handleAbort();
         logger.debug('[Codex] Abort completed, proceeding with termination');
+        storedSessionIdForResume = null;
+        persistCodexSessionMetadata(null);
 
         try {
             // Update lifecycle state to archived before closing
@@ -693,8 +737,6 @@ export async function runCodex(opts: {
         let wasCreated = false;
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
-        // If we restart (e.g., mode change), use this to carry a resume file
-        let nextExperimentalResume: string | null = null;
 
         while (!shouldExit) {
             logActiveHandles('loop-top');
@@ -740,6 +782,8 @@ export async function runCodex(opts: {
                 } catch (e) {
                     logger.debug('[Codex] Error while searching resume file', e);
                 }
+                persistCodexSessionMetadata(null);
+                storedSessionIdForResume = null;
                 client.clearSession();
                 wasCreated = false;
                 currentModeHash = null;
@@ -819,6 +863,11 @@ export async function runCodex(opts: {
                         startConfig,
                         { signal: abortController.signal }
                     );
+                    const activeSessionId = client.getSessionId();
+                    if (activeSessionId) {
+                        storedSessionIdForResume = activeSessionId;
+                        persistCodexSessionMetadata(activeSessionId);
+                    }
                     wasCreated = true;
                     first = false;
                 } else {
@@ -827,6 +876,11 @@ export async function runCodex(opts: {
                         { signal: abortController.signal }
                     );
                     logger.debug('[Codex] continueSession response:', response);
+                    const activeSessionId = client.getSessionId();
+                    if (activeSessionId) {
+                        storedSessionIdForResume = activeSessionId;
+                        persistCodexSessionMetadata(activeSessionId);
+                    }
                 }
             } catch (error) {
                 logger.warn('Error in codex session:', error);
@@ -847,6 +901,7 @@ export async function runCodex(opts: {
                     if (client.hasActiveSession()) {
                         storedSessionIdForResume = client.storeSessionForResume();
                         logger.debug('[Codex] Stored session after unexpected error:', storedSessionIdForResume);
+                        persistCodexSessionMetadata(storedSessionIdForResume);
                     }
                 }
             } finally {
@@ -870,6 +925,7 @@ export async function runCodex(opts: {
         // Clean up resources when main loop exits
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');
+        persistCodexSessionMetadata(null);
         try {
             logger.debug('[codex]: sendSessionDeath');
             session.sendSessionDeath();
