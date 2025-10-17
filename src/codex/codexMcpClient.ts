@@ -13,6 +13,11 @@ import { execSync } from 'child_process';
 
 const DEFAULT_TIMEOUT = 14 * 24 * 60 * 60 * 1000; // 14 days, which is the half of the maximum possible timeout (~28 days for int32 value in NodeJS)
 
+export interface CodexResumeIdentifiers {
+    sessionId: string | null;
+    conversationId: string | null;
+}
+
 /**
  * Get the correct MCP subcommand based on installed codex version
  * Versions >= 0.43.0-alpha.5 use 'mcp-server', older versions use 'mcp'
@@ -275,24 +280,39 @@ export class CodexMcpClient {
         return this.sessionId;
     }
 
+    getConversationId(): string | null {
+        return this.conversationId;
+    }
+
     hasActiveSession(): boolean {
         return this.sessionId !== null;
     }
 
     clearSession(): void {
-        // Store the previous session ID before clearing for potential resume
         const previousSessionId = this.sessionId;
+        const previousConversationId = this.conversationId;
         this.sessionId = null;
         this.conversationId = null;
-        logger.debug('[CodexMCP] Session cleared, previous sessionId:', previousSessionId);
+        logger.debug('[CodexMCP] Session cleared, previous identifiers:', {
+            sessionId: previousSessionId,
+            conversationId: previousConversationId
+        });
     }
 
     /**
      * Store the current session ID without clearing it, useful for abort handling
      */
-    storeSessionForResume(): string | null {
-        logger.debug('[CodexMCP] Storing session for potential resume:', this.sessionId);
-        return this.sessionId;
+    storeSessionForResume(): CodexResumeIdentifiers | null {
+        const info: CodexResumeIdentifiers = {
+            sessionId: this.sessionId,
+            conversationId: this.conversationId
+        };
+        if (!info.sessionId && !info.conversationId) {
+            logger.debug('[CodexMCP] No identifiers available to store for resume');
+            return null;
+        }
+        logger.debug('[CodexMCP] Storing identifiers for potential resume:', info);
+        return info;
     }
 
     async disconnect(): Promise<void> {
